@@ -1,0 +1,905 @@
+# P4LTL User Guide for LLM
+
+本文件的目标不是介绍论文背景，而是给后续大模型一个“可直接照着生成”的 P4LTL 规范语言说明。
+默认目标是生成能被当前仓库里的 `P4LTL-Translator` 和 `P4LTL-Validator` 接受的 `.p4ltl` 文件。
+
+## 1. 最小结论
+
+一个合法的 `.p4ltl` 文件至少应包含一行：
+
+```text
+//#LTLProperty: <P4LTL公式>
+```
+
+常见可选附加行：
+
+```text
+//#LTLFairness: <P4LTL公式>
+//#LTLVariables: a:int,b:int,flag:bool,x:bv32
+//#CPI: <P4LTL公式>
+//#CPI_SPEC: <P4LTL公式>
+//#CPI_SIMP: <key约束1>; <key约束2>; <动作条件>
+```
+
+最简单例子：
+
+```text
+//#LTLProperty: <>(AP(drop))
+```
+
+## 2. 文件级规则
+
+- 文件扩展名通常用 `.p4ltl`。
+- `//#LTLProperty:` 必须且通常只应出现一次。
+- `//#LTLFairness:` 可选，建议最多一行；如果有多个公平性约束，优先手工写成一个大公式。
+- `//#LTLVariables:` 可选，用来声明自由变量及类型。
+- `//#CPI:`、`//#CPI_SPEC:`、`//#CPI_SIMP:` 用于控制平面规则约束；如果只是描述数据包时序性质，可以不写。
+- 注释前缀建议固定用 `//#`，不要换成别的注释格式。
+- 每一行只放一个 marker，不要把多个 marker 写在同一行。
+
+推荐骨架：
+
+```text
+//#LTLVariables: a:int,b:int
+//#LTLProperty: <P4LTL公式>
+//#LTLFairness: <P4LTL公式>
+//#CPI_SPEC: <P4LTL公式>
+```
+
+## 3. 用户应以哪个语法为准
+
+用户直接写的 `.p4ltl` 文件，首先由 `P4LTL-Translator` 的 C++ 解析器解析。
+因此，用户可写语法应以 `P4LTL-Translator/frontends/parsers/p4ltl/` 下的 lexer/parser 为准。
+
+这意味着：
+
+- 要用 `AP(...)` 包裹原子命题。
+- 时序算子用 `[]`、`<>`、`X`、`U`、`W`、`R`。
+- `Apply` 和 `Key` 首字母大写。
+- `old`、`fwd`、`drop`、`valid`、`true`、`false` 必须小写。
+- `ipmask(...)` 这种形式在 validator 的 Java 解析器里存在，但当前 translator 的用户输入语法里不支持，不要生成。
+
+## 4. 顶层公式语法
+
+P4LTL 顶层公式 `<P4LTL公式>` 可由以下结构递归组成：
+
+- `phi && psi`
+- `phi || psi`
+- `phi ==> psi`
+- `phi U psi`
+- `phi W psi`
+- `phi R psi`
+- `[](phi)`
+- `<>(phi)`
+- `X(phi)`
+- `!phi`
+- `(phi)`
+- `AP(predicate)`
+
+注意：
+
+- 当前用户语法里没有 `<==>`，不要生成双向蕴含。
+- `[]`、`<>`、`X` 后面建议总是显式写括号。
+- `W` 是弱直到，系统支持。
+- `!` 可以作用在时序公式，也可以作用在谓词上。
+
+## 5. AP 内允许的内容
+
+`AP(...)` 内部必须是“谓词”，允许的形式如下。
+
+### 5.1 内置事件/谓词
+
+- `drop`
+- `fwd(term)`
+- `Apply(table)`
+- `Apply(table, action)`
+- `valid(name)`
+
+语义上通常理解为：
+
+- `drop`：当前包被丢弃。
+- `fwd(x)`：当前包被转发到端口 `x`。
+- `Apply(t)`：表 `t` 被应用。
+- `Apply(t, a)`：表 `t` 选择了动作 `a`。
+- `valid(hdr.xxx)`：该头当前有效。
+
+### 5.2 比较表达式
+
+- `term == term`
+- `term != term`
+- `term > term`
+- `term >= term`
+- `term < term`
+- `term <= term`
+
+### 5.3 谓词逻辑连接
+
+- `pred && pred`
+- `pred || pred`
+- `pred ==> pred`
+- `!pred`
+- `(pred)`
+
+重要限制：
+
+- 不要写 `AP(true)` 或 `AP(false)`。当前用户语法里，`true/false` 是 term，不是直接合法的 predicate。
+- 如果想表达常真，优先写一个明确条件，或者写 `AP(x == x)` 这类比较形式。
+
+## 6. term 语法
+
+`term` 是比较表达式左右两边、`fwd(...)` 参数、数组索引等位置可出现的内容。
+
+允许形式：
+
+- `identifier`
+- `identifier[term]`
+- `old(term)`
+- `Key(table, key)`
+- `term + term`
+- `term - term`
+- `term * term`
+- `term / term`
+- `term % term`
+- `(term)`
+- 十进制整数，例如 `0`、`5`、`123`
+- 十六进制整数，例如 `0xff`、`0x7b7b7b7b`
+- `true`
+- `false`
+
+说明：
+
+- 数组访问只建议写单下标形式，例如 `reg[a]`、`registerVRound_0[3]`。
+- `old(term)` 表示前态值。常见写法如 `old(hdr.ipv4.dstAddr)`、`old(r_state_dropping[a])`。
+- `Key(table, key)` 用于描述控制平面表 key 条件。
+- `* / %` 在 translator 的用户语法里是支持的，但 benchmark 中最常见的是 `+ -` 与比较；若非必要，优先生成更简单表达式。
+
+## 7. identifier 允许的字符
+
+合法名字大致满足：
+
+- 以字母、下划线或 `~` 开头
+- 后续可包含字母、数字、下划线、`~`、`#`、`.` 
+
+因此以下通常是合法的：
+
+- `standard_metadata.ingress_port`
+- `hdr.ipv4.dstAddr`
+- `meta.local_metadata.out_port`
+- `protect_c_last_primary`
+- `acceptor_tbl_0`
+- `_drop`
+
+以下风格不要生成：
+
+- 带空格的名字
+- 带引号的名字
+- 使用 `-` 连接标识符
+
+## 8. 保守可用的类型与字面量
+
+### 8.1 数值字面量
+
+推荐只用：
+
+- 十进制：`0`、`1`、`42`
+- 十六进制：`0xffffffffffff`、`0x7b7b7b7b`
+
+不要生成：
+
+- 浮点数
+- 字符串字面量
+- IP 地址字面量
+- `8bv32` 这类位向量字面量
+
+### 8.2 `#LTLVariables` 变量类型
+
+支持的保守类型：
+
+- `bool`
+- `int`
+- `Ref`
+- `bvN`，例如 `bv8`、`bv16`、`bv32`
+
+推荐写法：
+
+```text
+//#LTLVariables: a:int,b:int,port:int,flag:bool
+```
+
+对 LLM 的建议：
+
+- 如果只是表示“某个未知端口号/实例号/数组下标”，优先用 `int`。
+- 如果没有明确的位宽需求，不要生成 `bvN`。
+- 自由变量名尽量短且稳定，如 `a`、`b`、`inst`、`port`。
+
+## 9. 时序公式常用模板
+
+### 9.1 一直满足某条件
+
+```text
+//#LTLProperty: [](AP(cond))
+```
+
+### 9.2 最终会发生某事件
+
+```text
+//#LTLProperty: <>(AP(event))
+```
+
+### 9.3 如果现在满足前提，则下一步开始保持某性质直到某事件出现
+
+```text
+//#LTLProperty: [](AP(pre) ==> X(AP(keep) W AP(stop)))
+```
+
+### 9.4 如果当前发生某事件，则下一步仍满足某约束
+
+```text
+//#LTLProperty: [](AP(trigger) ==> X(AP(next_cond)))
+```
+
+### 9.5 否定一个“永远都成立”的说法
+
+```text
+//#LTLProperty: ![](AP(cond))
+```
+
+### 9.6 多个目标最终都要反复命中
+
+```text
+//#LTLProperty: [](<>(AP(goal1))) && [](<>(AP(goal2))) && [](<>(AP(goal3)))
+```
+
+## 10. 面向“数据包行为”怎么写
+
+如果你想让 LLM 生成“符合要求的数据包行为性质”，优先使用下面几类字段：
+
+- `standard_metadata.ingress_port`
+- `standard_metadata.egress_port`
+- `standard_metadata.egress_spec`
+- `hdr.<header>.<field>`
+- `meta.<...>`
+- `old(hdr.<...>)`
+- `valid(hdr.<...>)`
+- `drop`
+- `fwd(port)`
+
+典型写法：
+
+```text
+//#LTLProperty: [](AP(valid(hdr.ipv4) && standard_metadata.ingress_port == 1) ==> <>(AP(drop)))
+```
+
+```text
+//#LTLProperty: [](AP(hdr.paxos.rnd == b && !drop) ==> X([](AP(hdr.paxos.rnd < b ==> drop))))
+```
+
+```text
+//#LTLProperty: [](<>(AP(standard_metadata.ingress_port == 0 && old(hdr.ethernet.dstAddr) != 0xffffffffffff && fwd(1))))
+```
+
+生成建议：
+
+- 尽量用 header/meta/standard_metadata 中真实存在的字段名。
+- 如果要表达“同一个包进入后最终转发到某端口”，常用 `fwd(k)`。
+- 如果要表达“之前的值”，优先用 `old(...)`，不要自己发明 `prev(...)`。
+
+## 11. 面向“规则/控制平面约束”怎么写
+
+如果你想让 LLM 生成“规则必须匹配/某动作必须被选择”的约束，有三种层级。
+
+### 11.1 直接写 `Apply`
+
+```text
+//#LTLProperty: [](AP(Apply(route_tbl, set_nhop)))
+```
+
+### 11.2 用 `#CPI:` 直接写控制平面公式
+
+```text
+//#CPI: [](AP(Key(route_tbl, meta.dst) == a ==> Apply(route_tbl, set_nhop)))
+```
+
+这是最通用、最稳妥的控制平面约束写法。
+
+### 11.3 用 `#CPI_SPEC:`
+
+推荐写法同样保持为“全局 + AP + 蕴含”：
+
+```text
+//#CPI_SPEC: [](AP(Key(updatePit_table_0, meta.flow_metadata.hasFIBentry) == 1 ==> Apply(updatePit_table_0, updatePit_entry)))
+```
+
+对当前实现，`#CPI_SPEC:` 最安全的形式就是：
+
+```text
+//#CPI_SPEC: [](AP(<key条件> ==> Apply(<table>, <action>)))
+```
+
+### 11.4 用 `#CPI_SIMP:` 生成简单规则
+
+语法是：
+
+```text
+//#CPI_SIMP: <条件1>; <条件2>; ... ; <动作条件>
+```
+
+系统会把它等价改写成：
+
+```text
+[](AP((true && 条件1 && 条件2 && ...) ==> 动作条件))
+```
+
+例子：
+
+```text
+//#CPI_SIMP: Key(updatePit_table_0, meta.flow_metadata.hasFIBentry) == 1; Apply(updatePit_table_0, updatePit_entry)
+```
+
+再比如：
+
+```text
+//#CPI_SIMP: Key(pit_table_0, meta.flow_metadata.packetType) == 0x05; Apply(pit_table_0, readPitEntry)
+```
+
+生成建议：
+
+- 如果你只想生成“一条表规则的 key/action 关系”，优先用 `#CPI_SIMP:`。
+- 如果你要写复杂规则组合，优先用 `#CPI:` 或 `#CPI_SPEC:`。
+- `Apply(table, action)` 比单独 `Apply(table)` 更具体，更适合给 LLM 用。
+
+## 12. LLM 生成时必须遵守的硬约束
+
+- 只输出当前语法支持的关键字。
+- 只使用 `AP(...)` 作为原子命题外壳，不要写裸谓词作为顶层时序公式。
+- `Apply`、`Key` 必须大写首字母。
+- `drop`、`fwd`、`valid`、`old` 必须小写。
+- 不要发明新的函数名，如 `forward(...)`、`dropped(...)`、`prev(...)`、`table_hit(...)`。
+- 不要使用量词，如 `forall`、`exists`。
+- 不要使用时序别名，如 `G/F`；请改成 `[]` 和 `<>`。
+- 不要使用双向蕴含 `<==>`。
+- 不要输出中文标点。
+- 不要在公式里放注释。
+- 不要假设字段名存在；若不确定，应沿用用户提供的字段名。
+
+## 13. LLM 最推荐的输出模板
+
+### 模板 A：纯时序性质
+
+```text
+//#LTLVariables: a:int,b:int
+//#LTLProperty: [](AP(<前提>) ==> X(AP(<持续条件>) W AP(<终止条件>)))
+//#LTLFairness: [](<>(AP(<公平性条件>)))
+```
+
+### 模板 B：端口转发/丢包类
+
+```text
+//#LTLProperty: [](AP(<包进入条件>) ==> <>(AP(fwd(<端口号或变量>))))
+//#LTLFairness: [](<>(AP(<该类包持续出现的条件>)))
+```
+
+### 模板 C：控制平面规则类
+
+```text
+//#LTLVariables: a:int
+//#LTLProperty: [](AP(<数据面行为条件>))
+//#CPI_SPEC: [](AP(Key(<table>, <key-expr>) == a ==> Apply(<table>, <action>)))
+```
+
+### 模板 D：极简规则生成
+
+```text
+//#CPI_SIMP: Key(<table>, <key-expr>) == <value>; Apply(<table>, <action>)
+//#LTLProperty: [](AP(<与该规则配套的数据面性质>))
+```
+
+## 14. 推荐示例
+
+### 示例 1：最终丢包
+
+```text
+//#LTLProperty: <>(AP(drop))
+```
+
+### 示例 2：若处于未完成状态，则在到达父端口前一直保持未完成
+
+```text
+//#LTLProperty: []((AP(meta.local_metadata.is_completed == 0)) ==> (AP(meta.local_metadata.is_completed == 0) W AP(meta.local_metadata.out_port == meta.local_metadata.pkt_par)))
+//#LTLFairness: [](AP(valid(hdr.bfsTag) && ((meta.local_metadata.out_port != 0) || (meta.local_metadata.pkt_par != 0))))
+```
+
+### 示例 3：三个出口最终都会被反复命中
+
+```text
+//#LTLProperty: [](<>(AP(standard_metadata.ingress_port == 0 && old(hdr.ethernet.dstAddr) != 0xffffffffffff && old(hdr.ipv4.dstAddr) != 0x7b7b7b7b && old(hdr.ethernet.srcAddr) != 0x0 && fwd(1)))) && [](<>(AP(standard_metadata.ingress_port == 0 && old(hdr.ethernet.dstAddr) != 0xffffffffffff && old(hdr.ipv4.dstAddr) != 0x7b7b7b7b && old(hdr.ethernet.srcAddr) != 0x0 && fwd(2)))) && [](<>(AP(standard_metadata.ingress_port == 0 && old(hdr.ethernet.dstAddr) != 0xffffffffffff && old(hdr.ipv4.dstAddr) != 0x7b7b7b7b && old(hdr.ethernet.srcAddr) != 0x0 && fwd(3))))
+//#LTLFairness: [](<>(AP(standard_metadata.ingress_port == 0 && old(hdr.ethernet.dstAddr) != 0xffffffffffff && old(hdr.ipv4.dstAddr) != 0x7b7b7b7b && old(hdr.ethernet.srcAddr) != 0x0)))
+```
+
+### 示例 4：规则简写
+
+```text
+//#CPI_SIMP: Key(updatePit_table_0, meta.flow_metadata.hasFIBentry) == 1; Apply(updatePit_table_0, updatePit_entry)
+//#LTLProperty: AP(meta.flow_metadata.packetType == 0x06 && !drop) ==> X(AP(meta.flow_metadata.packetType == 0x06 ==> drop) W AP(meta.flow_metadata.packetType == 0x05 && !drop))
+```
+
+## 15. 常见错误
+
+- 把 `Apply` 写成 `apply`。
+- 把 `Key` 写成 `key`。
+- 写 `AP(true)`。
+- 在顶层写 `G(phi)` 而不是 `[](phi)`。
+- 在比较里使用不存在的字符串字面量。
+- 使用未声明的自由变量，例如 `a`、`b`，却没写 `//#LTLVariables:`。
+- 在 `#CPI_SIMP:` 里忘记用分号分隔。
+- 在 `old(...)` 里塞无法解析的复杂自定义函数。
+- 用带空格、中文、连字符的标识符名。
+
+## 16. 给后续 LLM 的最终生成要求
+
+如果你是一个要生成 `.p4ltl` 文件的大模型，请遵守以下输出策略：
+
+- 优先生成 1 条 `//#LTLProperty:`。
+- 如果使用自由变量，必须额外生成 1 条 `//#LTLVariables:`。
+- 如果涉及控制平面规则，优先生成 `//#CPI_SIMP:` 或 `//#CPI_SPEC:`，不要自创标签。
+- 所有公式都用 ASCII 字符。
+- 所有关键字大小写必须精确匹配本指南。
+- 除非用户明确要求复杂算术，否则只生成比较、`old(...)`、`valid(...)`、`drop`、`fwd(...)`、`Apply(...)`。
+- 如果字段名不确定，复用用户给定的 P4 字段名，不要猜新字段。
+- 若需多目标性质，优先用 `&&` 显式连接，不要拆成多条 `//#LTLProperty:`。
+
+## 17. 一句话原则
+
+生成 `.p4ltl` 时，优先使用：
+
+- `//#LTLProperty: [] / <> / X / U / W / R + AP(...)`
+- `AP(...)` 内只放比较、`drop`、`fwd(...)`、`valid(...)`、`Apply(...)`
+- 需要未知常量就写 `//#LTLVariables: a:int,b:int`
+- 需要规则约束就写 `//#CPI_SPEC:` 或 `//#CPI_SIMP:`
+
+只要遵守上面这四条，生成结果大概率就能被当前仓库接受。
+
+## 18. LLM 一页 Prompt 版
+
+这一节是给后续大模型直接复制使用的“短 prompt 版本”。
+如果你只想把最关键规则喂给模型，而不想给它整份 guide，优先使用这一段。
+
+### 18.1 极简系统提示词
+
+```text
+你要生成 P4LTL 属性文件内容，目标是让当前 P4LTL-Translator 和 P4LTL-Validator 能成功解析和验证。
+
+严格遵守以下规则：
+
+1. 输出内容是 .p4ltl 文件文本，不要输出解释。
+2. 至少包含一行： //#LTLProperty: <公式>
+3. 可选行只有：
+   //#LTLFairness:
+   //#LTLVariables:
+   //#CPI:
+   //#CPI_SPEC:
+   //#CPI_SIMP:
+4. 顶层时序算子只用：
+   []  <>  X  U  W  R  !  &&  ||  ==>
+5. 原子命题必须写成 AP(...)
+6. AP(...) 内只允许：
+   - drop
+   - fwd(term)
+   - Apply(table)
+   - Apply(table, action)
+   - valid(name)
+   - term == term, !=, >, >=, <, <=
+   - 谓词之间的 && || ==> !
+7. term 只允许：
+   - identifier
+   - identifier[index]
+   - old(term)
+   - Key(table, key)
+   - term + term
+   - term - term
+   - term * term
+   - term / term
+   - term % term
+   - 十进制整数
+   - 十六进制整数
+   - true / false
+8. 关键字大小写必须正确：
+   - Apply, Key 大写首字母
+   - drop, fwd, valid, old, true, false 小写
+9. 不要使用：
+   - G / F
+   - <==>
+   - forall / exists
+   - 自定义函数名
+   - ipmask(...)
+   - 中文标点
+10. 如果使用自由变量，必须写 //#LTLVariables: name:type
+11. 若涉及控制平面规则，优先使用：
+   - //#CPI_SPEC: [](AP(Key(table, key) == value ==> Apply(table, action)))
+   - 或 //#CPI_SIMP: 条件1; 条件2; Apply(table, action)
+12. 除非用户明确要求复杂算术，否则优先生成简单比较、old(...)、valid(...)、drop、fwd(...)、Apply(...)
+13. 若字段名不确定，复用用户给出的字段名，不要自造字段。
+```
+
+### 18.2 更实用的生成提示词
+
+如果你希望模型不仅遵守语法，还尽量生成“风格接近现有 benchmark”的属性，可使用下面版本：
+
+```text
+你要为 P4 程序生成一个 `.p4ltl` 文件。
+
+输出目标：
+- 必须是可被当前 P4LTL-Translator 接受的用户输入语法
+- 优先生成与现有 benchmark 风格一致的属性
+- 只输出文件内容，不要解释
+
+规则：
+- 至少输出一行 `//#LTLProperty: ...`
+- 如果需要公平性，再输出 `//#LTLFairness: ...`
+- 如果需要参数变量，再输出 `//#LTLVariables: a:int,b:int`
+- 如果需要控制平面规则，再输出 `//#CPI_SPEC:` 或 `//#CPI_SIMP:`
+
+顶层公式只用：
+- `[]`, `<>`, `X`, `U`, `W`, `R`, `!`, `&&`, `||`, `==>`
+
+AP 内只用：
+- `drop`
+- `fwd(term)`
+- `Apply(table)`
+- `Apply(table, action)`
+- `valid(name)`
+- 比较表达式
+
+term 只用：
+- 字段名
+- 数组访问
+- `old(term)`
+- `Key(table, key)`
+- `+ - * / %`
+- 整数和十六进制常量
+
+必须避免：
+- `AP(true)`
+- `G/F`
+- `<==>`
+- `ipmask(...)`
+- 新造函数
+- 不存在的字段名
+
+偏好：
+- 端口行为用 `standard_metadata.ingress_port / egress_port / egress_spec`
+- 头字段用 `hdr.xxx.yyy`
+- 状态字段用 `meta.xxx.yyy`
+- 前态值用 `old(...)`
+- 转发用 `fwd(k)`
+- 丢包用 `drop`
+- 多个目标用 `&&` 连接成一条 `//#LTLProperty`
+```
+
+### 18.3 最短 few-shot 示例
+
+```text
+输入需求：验证某类包最终会被丢弃
+输出：
+//#LTLProperty: <>(AP(drop))
+
+输入需求：验证 ingress_port 为 1 的 IPv4 包最终会从端口 3 转发
+输出：
+//#LTLProperty: [](AP(valid(hdr.ipv4) && standard_metadata.ingress_port == 1) ==> <>(AP(fwd(3))))
+
+输入需求：约束表 route_tbl 在 key=a 时必须选择 set_nhop
+输出：
+//#LTLVariables: a:int
+//#CPI_SPEC: [](AP(Key(route_tbl, meta.dst) == a ==> Apply(route_tbl, set_nhop)))
+//#LTLProperty: [](AP(valid(hdr.ipv4)))
+```
+
+## 19. 自然语言到模板映射速查表
+
+这一节用于把自然语言需求快速翻译成 `.p4ltl` 结构。
+推荐流程是：
+
+1. 先识别需求类型
+2. 再选模板
+3. 最后把字段名、端口号、寄存器名、动作名代入
+
+### 19.1 “最终会发生”
+
+自然语言触发词：
+
+- 最终会
+- eventually
+- 最后能够
+- 迟早会
+
+推荐模板：
+
+```text
+//#LTLProperty: <>(AP(<事件>))
+```
+
+例子：
+
+- “这个包最终会被丢弃”
+
+```text
+//#LTLProperty: <>(AP(drop))
+```
+
+- “ingress 口为 1 的包最终会从端口 3 发出”
+
+```text
+//#LTLProperty: [](AP(standard_metadata.ingress_port == 1) ==> <>(AP(fwd(3))))
+```
+
+### 19.2 “一直满足 / 永远满足”
+
+自然语言触发词：
+
+- 一直
+- 永远
+- 总是
+- globally
+- always
+
+推荐模板：
+
+```text
+//#LTLProperty: [](AP(<条件>))
+```
+
+例子：
+
+- “始终不会发到非法端口”
+
+```text
+//#LTLProperty: [](AP(standard_metadata.egress_spec >= 0 && standard_metadata.egress_spec < 4))
+```
+
+### 19.3 “如果现在满足 A，那么下一步开始保持 B，直到 C”
+
+自然语言触发词：
+
+- 一旦
+- 如果当前
+- 从下一步开始
+- 直到
+- before/until
+
+推荐模板：
+
+```text
+//#LTLProperty: [](AP(A) ==> X(AP(B) W AP(C)))
+```
+
+例子：
+
+- “一旦进入 dropping 状态，就一直保持 ok_to_drop 为 0，直到时间到达 drop_time”
+
+```text
+//#LTLProperty: [](AP(meta.codel.state_dropping == 1 && meta.codel.ok_to_drop == 0) ==> X(AP(meta.codel.ok_to_drop == 0) W AP(meta.codel.time_now >= meta.codel.drop_time)))
+```
+
+### 19.4 “如果 A，则下一步必须 B”
+
+自然语言触发词：
+
+- 下一步必须
+- 下一拍
+- next
+- 紧接着
+
+推荐模板：
+
+```text
+//#LTLProperty: [](AP(A) ==> X(AP(B)))
+```
+
+例子：
+
+- “如果当前从 primary 接受，则下一步 secondary 在保护期内必须拒绝”
+
+```text
+//#LTLProperty: [](AP(meta.accepted == 1 && standard_metadata.ingress_port == meta.primary) ==> X(AP((standard_metadata.ingress_port == meta.secondary && standard_metadata.ingress_global_timestamp - protect_c_last_primary[0] <= meta.period) ==> meta.accepted == 0)))
+```
+
+### 19.5 “在 C 发生前，A 一直成立”
+
+自然语言触发词：
+
+- 在……之前一直
+- before ... holds
+- unless/until
+
+推荐模板：
+
+```text
+//#LTLProperty: AP(A) W AP(C)
+```
+
+或带前提条件：
+
+```text
+//#LTLProperty: [](AP(trigger) ==> (AP(A) W AP(C)))
+```
+
+例子：
+
+- “在收到多数派前，一直 drop”
+
+```text
+//#LTLProperty: []((AP(hdr.paxos.inst == a && drop) ==> X((AP((hdr.paxos.inst == a) ==> drop)) W (AP(meta.paxos_metadata.ack_acceptors == 6 || meta.paxos_metadata.ack_acceptors == 5 || meta.paxos_metadata.ack_acceptors == 3)))))
+```
+
+### 19.6 “不应该总是……”
+
+自然语言触发词：
+
+- 不应该总是
+- 不是一直
+- not always
+
+推荐模板：
+
+```text
+//#LTLProperty: ![](AP(cond))
+```
+
+例子：
+
+- “不应该总是转发到端口 1”
+
+```text
+//#LTLProperty: ![](AP(fwd(1)))
+```
+
+### 19.7 “多个目标都要最终发生”
+
+自然语言触发词：
+
+- 三个端口都要被命中
+- 每个目标最终都要出现
+- all of ... eventually
+
+推荐模板：
+
+```text
+//#LTLProperty: [](<>(AP(goal1))) && [](<>(AP(goal2))) && ...
+```
+
+例子：
+
+```text
+//#LTLProperty: [](<>(AP(fwd(1)))) && [](<>(AP(fwd(2)))) && [](<>(AP(fwd(3))))
+```
+
+### 19.8 “包头/字段有效性”
+
+自然语言触发词：
+
+- 某头存在
+- header valid
+- 头部有效
+
+推荐模板：
+
+```text
+//#LTLProperty: [](AP(valid(hdr.xxx)))
+```
+
+例子：
+
+```text
+//#LTLProperty: [](AP(valid(hdr.ipv4)))
+```
+
+### 19.9 “前态与现态比较”
+
+自然语言触发词：
+
+- 之前的值
+- old value
+- 上一轮值
+- 进入时的字段值
+
+推荐模板：
+
+```text
+//#LTLProperty: [](AP(old(field) == value) ==> AP(cond))
+```
+
+例子：
+
+```text
+//#LTLProperty: [](AP(old(r_state_dropping[a]) == 1) ==> (AP(meta.codel.time_now >= meta.codel.drop_next ==> drop) W AP(standard_metadata.deq_timedelta < 5000)))
+```
+
+### 19.10 “控制平面规则约束”
+
+自然语言触发词：
+
+- 当 key 为某值时必须命中某动作
+- rule should select action
+- 表规则
+- action selection
+
+推荐模板 1：直接规则
+
+```text
+//#CPI_SPEC: [](AP(Key(table, key_expr) == value ==> Apply(table, action)))
+```
+
+推荐模板 2：简写规则
+
+```text
+//#CPI_SIMP: Key(table, key_expr) == value; Apply(table, action)
+```
+
+例子：
+
+```text
+//#CPI_SIMP: Key(updatePit_table_0, meta.flow_metadata.hasFIBentry) == 1; Apply(updatePit_table_0, updatePit_entry)
+```
+
+### 19.11 “需要公平性假设”
+
+自然语言触发词：
+
+- 假设这类包会持续到来
+- under fairness
+- 在持续输入下
+- 重复出现
+
+推荐模板：
+
+```text
+//#LTLFairness: [](<>(AP(<公平性条件>)))
+```
+
+或 benchmark 中常见的：
+
+```text
+//#LTLFairness: [](AP(<环境过滤条件>))
+```
+
+实践建议：
+
+- 如果你需要表达“某类流量持续出现”，优先用 `[](<>(AP(...)))`
+- 如果你只是要限制验证环境，例如“只看 ingress_port == 1 的包”，可用 `[](AP(...))`
+
+### 19.12 “需要未知参数”
+
+自然语言触发词：
+
+- 任意实例号
+- 任意端口
+- 用变量占位
+- symbolic constant
+
+推荐模板：
+
+```text
+//#LTLVariables: a:int,b:int
+//#LTLProperty: ...
+```
+
+例子：
+
+```text
+//#LTLVariables: a:int,b:int
+//#LTLProperty: [](AP(hdr.paxos.inst == a && hdr.paxos.msgtype == 3 && hdr.paxos.paxosval == b && !drop) ==> X(AP(hdr.paxos.msgtype == 1 && hdr.paxos.inst == a && !drop ==> hdr.paxos.paxosval == b) W AP(hdr.paxos.msgtype == 3)))
+```
+
+## 20. 生成决策清单
+
+当自然语言需求到来时，后续大模型应按下面顺序决策：
+
+1. 这是数据包时序性质，还是控制平面规则约束，还是两者同时存在？
+2. 是否需要公平性？如果需要，补 `//#LTLFairness:`
+3. 是否需要未知参数？如果需要，补 `//#LTLVariables:`
+4. 顶层应选 `[]`、`<>`、`X`、`W`、`U`、`R` 中哪一种？
+5. AP 内能否只用比较、`drop`、`fwd`、`valid`、`Apply` 来表达？
+6. 如果是规则约束，优先 `#CPI_SIMP`，否则用 `#CPI_SPEC`
+7. 检查大小写、字段名、十六进制常量、注释 marker 是否正确
+
+如果这 7 步都满足，再输出最终 `.p4ltl` 文本。
