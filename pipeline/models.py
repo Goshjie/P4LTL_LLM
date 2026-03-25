@@ -47,6 +47,10 @@ class GraphQueryResult(BaseModel):
 class IntentFeatureBundle(BaseModel):
     intent_type: str = "packet_behavior"
     temporal_pattern: str = "eventually"
+    template_family: str = "generic_temporal_property"
+    expressibility_level: str = "direct"
+    template_guidance: list[str] = Field(default_factory=list)
+    required_slot_hints: list[str] = Field(default_factory=list)
     trigger_conditions: list[str] = Field(default_factory=list)
     target_events: list[str] = Field(default_factory=list)
     state_constraints: list[str] = Field(default_factory=list)

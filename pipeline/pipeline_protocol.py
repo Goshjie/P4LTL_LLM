@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import signal
 import time
 from pathlib import Path
@@ -133,7 +134,7 @@ class IntentToP4LTLPipeline:
                 )
             )
 
-            if syntax_validation.valid and context_validation.valid and semantic_review.semantic_verdict in {"correct", "plausible"}:
+            if syntax_validation.valid and context_validation.valid and semantic_review.semantic_verdict in self._accepted_semantic_verdicts(request):
                 return IntentToP4LTLResult(
                     ok=True,
                     final_spec_text=candidate.spec_text,
@@ -187,11 +188,45 @@ class IntentToP4LTLPipeline:
                     output_schema=IntentFeatureBundle,
                     stage_name="decomposer",
                 )
-                return self._coerce_model(output, IntentFeatureBundle)
+                agent_features = self._coerce_model(output, IntentFeatureBundle)
+                heuristic_features = self.heuristic.decompose(request.intent, request.admin_description, toolkit)
+                return self._merge_feature_bundles(agent_features, heuristic_features)
             except Exception:
                 if not self.allow_heuristic_fallback:
                     raise
         return self.heuristic.decompose(request.intent, request.admin_description, toolkit)
+
+    def _merge_feature_bundles(
+        self,
+        agent_features: IntentFeatureBundle,
+        heuristic_features: IntentFeatureBundle,
+    ) -> IntentFeatureBundle:
+        updates: dict[str, Any] = {}
+
+        if agent_features.template_family == "generic_temporal_property" and heuristic_features.template_family != "generic_temporal_property":
+            updates["template_family"] = heuristic_features.template_family
+        if agent_features.expressibility_level == "direct" and heuristic_features.expressibility_level != "direct":
+            updates["expressibility_level"] = heuristic_features.expressibility_level
+        if not agent_features.template_guidance and heuristic_features.template_guidance:
+            updates["template_guidance"] = heuristic_features.template_guidance
+        if not agent_features.required_slot_hints and heuristic_features.required_slot_hints:
+            updates["required_slot_hints"] = heuristic_features.required_slot_hints
+        if not agent_features.target_events and heuristic_features.target_events:
+            updates["target_events"] = heuristic_features.target_events
+        if not agent_features.state_constraints and heuristic_features.state_constraints:
+            updates["state_constraints"] = heuristic_features.state_constraints
+        if not agent_features.control_plane_constraints and heuristic_features.control_plane_constraints:
+            updates["control_plane_constraints"] = heuristic_features.control_plane_constraints
+        if not agent_features.required_entities and heuristic_features.required_entities:
+            updates["required_entities"] = heuristic_features.required_entities
+        if not agent_features.assumptions and heuristic_features.assumptions:
+            updates["assumptions"] = heuristic_features.assumptions
+        if agent_features.decomposition_summary in {"", "intent_type=packet_behavior, temporal_pattern=eventually, targets=['generic-condition']"}:
+            updates["decomposition_summary"] = heuristic_features.decomposition_summary
+
+        if not updates:
+            return agent_features
+        return agent_features.model_copy(update=updates)
 
     def _generate_candidate(
         self,
@@ -271,8 +306,6 @@ class IntentToP4LTLPipeline:
         return Agent(
             name="p4ltl-generator",
             model=self.model,
-            tools=self._build_tool_functions(toolkit, include_validator=True),
-            tool_choice="auto",
             instructions=[
                 "Return a valid JSON object that matches the P4LTLCandidate schema.",
                 "Generate a complete .p4ltl file in the current repository syntax.",
@@ -358,6 +391,14 @@ Administrator description:
 Intent feature bundle:
 {features.model_dump_json(indent=2)}
 
+Selected template family:
+- family: {features.template_family}
+- expressibility: {features.expressibility_level}
+- guidance:
+{chr(10).join(f"  - {item}" for item in features.template_guidance) or "  - <none>"}
+- required slots:
+{chr(10).join(f"  - {item}" for item in features.required_slot_hints) or "  - <none>"}
+
 Aligned context summary:
 {toolkit.summarize_context()}
 
@@ -375,6 +416,8 @@ Repair feedback:
 
 Requirements:
 - Output only a valid JSON object matching the P4LTLCandidate schema.
+- Follow the selected template family instead of inventing a fresh formula pattern.
+- Every required slot from the template family must be grounded explicitly or called out in assumptions.
 - Generate ASCII-only .p4ltl content in spec_text.
 - spec_text must be the literal .p4ltl file body.
 - The minimum valid shape is:
@@ -476,6 +519,14 @@ Administrator description:
 Intent feature bundle:
 {features.model_dump_json(indent=2)}
 
+Selected template family:
+- family: {features.template_family}
+- expressibility: {features.expressibility_level}
+- guidance:
+{chr(10).join(f"  - {item}" for item in features.template_guidance) or "  - <none>"}
+- required slots:
+{chr(10).join(f"  - {item}" for item in features.required_slot_hints) or "  - <none>"}
+
 Aligned context summary:
 {toolkit.summarize_context()}
 
@@ -490,6 +541,8 @@ Validation feedback:
 
 Requirements:
 - Return only a valid JSON object matching the P4LTLCandidate schema.
+- Preserve the selected template family unless the feedback proves it was the wrong class.
+- Fill every required slot from the template family explicitly before finalizing.
 - spec_text must be the literal .p4ltl file body using current repository syntax.
 - Keep or restore valid //# markers. The primary required line is //#LTLProperty: ...
 - Do not output any 'spec ... end' style DSL.
@@ -632,22 +685,33 @@ Requirements:
     def _coerce_model(self, content: Any, schema: Any) -> Any:
         if isinstance(content, schema):
             return content
-        if _looks_like_tool_plan(content):
-            raise TypeError(f"tool-plan-like output is not acceptable for {schema.__name__}: {content!r}")
+        if schema is P4LTLCandidate and _looks_like_tool_plan(content):
+            return P4LTLCandidate(
+                spec_text=json.dumps(content, ensure_ascii=False, indent=2),
+                assumptions=["The model returned a tool-plan-like structure; it was preserved as raw text so the repair round can replace it with real .p4ltl."],
+                self_checks=["tool-plan-like output coerced into raw spec_text for repair"],
+            )
         if isinstance(content, dict):
             return schema.model_validate(content)
         if schema is P4LTLCandidate and isinstance(content, str):
+            assumptions = ["The model returned a raw string; it was coerced into P4LTLCandidate.spec_text."]
+            self_checks = ["raw string output coerced before DSL repair"]
             if _looks_like_tool_plan_string(content):
-                raise TypeError(f"tool-plan-like string output is not acceptable for {schema.__name__}")
+                assumptions.append("The raw string resembles a tool plan or reasoning trace and must be replaced in a repair round.")
+                self_checks.append("detected tool-plan-like raw string")
             return P4LTLCandidate(
                 spec_text=content.strip(),
-                assumptions=["The model returned a raw string; it was coerced into P4LTLCandidate.spec_text."],
-                self_checks=["raw string output coerced before DSL repair"],
+                assumptions=assumptions,
+                self_checks=self_checks,
             )
         if hasattr(content, "model_dump"):
             payload = content.model_dump()
-            if _looks_like_tool_plan(payload):
-                raise TypeError(f"tool-plan-like output is not acceptable for {schema.__name__}: {payload!r}")
+            if schema is P4LTLCandidate and _looks_like_tool_plan(payload):
+                return P4LTLCandidate(
+                    spec_text=json.dumps(payload, ensure_ascii=False, indent=2),
+                    assumptions=["The model returned a tool-plan-like payload; it was preserved as raw text so the repair round can replace it with real .p4ltl."],
+                    self_checks=["tool-plan-like model_dump payload coerced into raw spec_text for repair"],
+                )
             return schema.model_validate(payload)
         raise TypeError(f"unexpected agent output type for {schema.__name__}: {type(content)!r}")
 
@@ -702,11 +766,14 @@ Requirements:
         context_validation: Any,
         semantic_review: SemanticReviewReport,
     ) -> str:
+        mismatch_lines = semantic_review.suspicious_mismatches or ["<none>"]
+        mismatch_block = "\n".join(f"- {item}" for item in mismatch_lines)
         return (
             "Candidate rejected.\n"
             f"Syntax: {syntax_validation.get('summary')}\n"
             f"Context: {context_validation.summary}\n"
             f"Semantic: {semantic_review.semantic_verdict} - {semantic_review.review_reason}\n"
+            f"Semantic mismatches to fix:\n{mismatch_block}\n"
         )
 
     def _apply_dsl_repair(self, candidate: P4LTLCandidate) -> P4LTLCandidate:
@@ -724,6 +791,11 @@ Requirements:
                 "self_checks": self_checks,
             }
         )
+
+    def _accepted_semantic_verdicts(self, request: IntentToP4LTLRequest) -> set[str]:
+        if request.benchmark_case_id and request.benchmark_case_id.startswith("sagefuzz:"):
+            return {"correct"}
+        return {"correct", "plausible"}
 
     def _build_repair_summary(
         self,
