@@ -177,17 +177,6 @@ def _classify_template_family(
             ["healthy-state condition", "selected next-hop field", "primary next-hop entity"],
         )
 
-    if any(token in text for token in ["拥塞", "reroute", "rehash", "迁移到其他路径", "notification", "update_flow_seed"]):
-        return (
-            "eventual_control_reaction",
-            "closed_loop",
-            [
-                "Use an always-trigger-implies-eventually-response structure.",
-                "Prefer a concrete congestion-detected trigger and an explicit reroute action or seed-update action as the eventual reaction.",
-            ],
-            ["congestion trigger", "eventual reroute action or seed update", "optional old/new path witness"],
-        )
-
     if any(token in text for token in ["telemetry", "probe", "逐跳", "每跳", "per-hop", "queue depth", "利用率", "monitoring data"]):
         if any(token in text for token in ["deliver", "主机端", "host", "观测"]):
             return (
@@ -207,6 +196,17 @@ def _classify_template_family(
                 "Prefer the closest local proxy for hop-by-hop accumulation rather than inventing end-to-end claims that the current DSL cannot ground.",
             ],
             ["in-network condition", "telemetry/probe header symbol", "updated field witness"],
+        )
+
+    if any(token in text for token in ["reroute", "rehash", "迁移到其他路径", "notification", "update_flow_seed", "反馈通知"]):
+        return (
+            "eventual_control_reaction",
+            "closed_loop",
+            [
+                "Use an always-trigger-implies-eventually-response structure.",
+                "Prefer a concrete congestion-detected trigger and an explicit reroute action or seed-update action as the eventual reaction.",
+            ],
+            ["congestion trigger", "eventual reroute action or seed update", "optional old/new path witness"],
         )
 
     if any(token in text for token in ["allow", "允许", "通过", "正常转发", "return traffic", "not be dropped"]):
