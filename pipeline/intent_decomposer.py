@@ -155,17 +155,6 @@ def _classify_template_family(
             ["host-facing exit condition", "telemetry header symbol", "EtherType field", "restored normal EtherType value"],
         )
 
-    if any(token in text for token in ["failover", "备用", "backup", "lfa", "主下一跳故障", "链路故障"]):
-        return (
-            "state_selects_backup_action",
-            "approximate",
-            [
-                "Use a failure-triggered property that selects the backup path on the next step or immediately.",
-                "Prefer comparing the selected next-hop field against the exact backup next-hop entity instead of a generic forwarding action.",
-            ],
-            ["failure condition", "selected next-hop field", "backup next-hop entity"],
-        )
-
     if any(token in text for token in ["主链路正常", "healthy", "primary path remains active", "继续使用主下一跳", "use primary"]):
         return (
             "state_selects_primary_action",
@@ -175,6 +164,17 @@ def _classify_template_family(
                 "Prefer exact next-hop equality or exact action selection over generic forwarding claims.",
             ],
             ["healthy-state condition", "selected next-hop field", "primary next-hop entity"],
+        )
+
+    if any(token in text for token in ["failover", "备用", "backup", "lfa", "主下一跳故障", "链路故障"]):
+        return (
+            "state_selects_backup_action",
+            "approximate",
+            [
+                "Use a failure-triggered property that selects the backup path on the next step or immediately.",
+                "Prefer comparing the selected next-hop field against the exact backup next-hop entity instead of a generic forwarding action.",
+            ],
+            ["failure condition", "selected next-hop field", "backup next-hop entity"],
         )
 
     if any(token in text for token in ["telemetry", "probe", "逐跳", "每跳", "per-hop", "queue depth", "利用率", "monitoring data"]):

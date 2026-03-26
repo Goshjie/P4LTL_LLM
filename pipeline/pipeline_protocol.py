@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import signal
 import time
 from pathlib import Path
@@ -68,6 +69,7 @@ class IntentToP4LTLPipeline:
         agent_timeout_seconds: float = 45.0,
         agent_max_retries: int = 2,
         agent_retry_delay_seconds: float = 2.0,
+        enable_template_family_enhancement: bool = True,
     ) -> None:
         self.model = model or build_default_model()
         self.strict_validation = strict_validation
@@ -81,6 +83,7 @@ class IntentToP4LTLPipeline:
         self.agent_timeout_seconds = agent_timeout_seconds
         self.agent_max_retries = agent_max_retries
         self.agent_retry_delay_seconds = agent_retry_delay_seconds
+        self.enable_template_family_enhancement = enable_template_family_enhancement
         self.syntax = P4LTLAgentSyntaxInterface(strict=strict_validation)
         self.heuristic = HeuristicIntentDecompiler()
 
@@ -190,11 +193,14 @@ class IntentToP4LTLPipeline:
                 )
                 agent_features = self._coerce_model(output, IntentFeatureBundle)
                 heuristic_features = self.heuristic.decompose(request.intent, request.admin_description, toolkit)
-                return self._merge_feature_bundles(agent_features, heuristic_features)
+                features = self._merge_feature_bundles(agent_features, heuristic_features)
+                return self._finalize_feature_bundle(features)
             except Exception:
                 if not self.allow_heuristic_fallback:
                     raise
-        return self.heuristic.decompose(request.intent, request.admin_description, toolkit)
+        return self._finalize_feature_bundle(
+            self.heuristic.decompose(request.intent, request.admin_description, toolkit)
+        )
 
     def _merge_feature_bundles(
         self,
@@ -203,11 +209,19 @@ class IntentToP4LTLPipeline:
     ) -> IntentFeatureBundle:
         updates: dict[str, Any] = {}
 
-        targeted_families = {"stateful_local", "in_band_header_added_or_preserved"}
-        if heuristic_features.template_family in targeted_families and agent_features.template_family != heuristic_features.template_family:
-            updates["template_family"] = heuristic_features.template_family
-        elif agent_features.template_family == "generic_temporal_property" and heuristic_features.template_family != "generic_temporal_property":
-            updates["template_family"] = heuristic_features.template_family
+        if self.enable_template_family_enhancement:
+            targeted_families = {
+                "stateful_local",
+                "guarded_forward_or_not_drop",
+                "in_band_header_added_or_preserved",
+                "header_removed_before_exit",
+                "state_selects_primary_action",
+                "state_selects_backup_action",
+            }
+            if heuristic_features.template_family in targeted_families and agent_features.template_family != heuristic_features.template_family:
+                updates["template_family"] = heuristic_features.template_family
+            elif agent_features.template_family == "generic_temporal_property" and heuristic_features.template_family != "generic_temporal_property":
+                updates["template_family"] = heuristic_features.template_family
         if updates.get("template_family") == heuristic_features.template_family:
             updates["expressibility_level"] = heuristic_features.expressibility_level
         elif agent_features.expressibility_level == "direct" and heuristic_features.expressibility_level != "direct":
@@ -233,6 +247,28 @@ class IntentToP4LTLPipeline:
             return agent_features
         return agent_features.model_copy(update=updates)
 
+    def _finalize_feature_bundle(self, features: IntentFeatureBundle) -> IntentFeatureBundle:
+        if self.enable_template_family_enhancement:
+            return features
+
+        summary = features.decomposition_summary
+        if summary:
+            summary = re.sub(
+                r"template_family=[^,]+",
+                "template_family=generic_temporal_property",
+                summary,
+                count=1,
+            )
+
+        return features.model_copy(
+            update={
+                "template_family": "generic_temporal_property",
+                "template_guidance": [],
+                "required_slot_hints": [],
+                "decomposition_summary": summary,
+            }
+        )
+
     def _generate_candidate(
         self,
         *,
@@ -244,15 +280,16 @@ class IntentToP4LTLPipeline:
         previous_candidate: Optional[P4LTLCandidate],
         round_id: int,
     ) -> P4LTLCandidate:
-        family_candidate = self._family_guided_candidate(
-            request=request,
-            features=features,
-            toolkit=toolkit,
-            feedback=feedback,
-            previous_candidate=previous_candidate,
-        )
-        if family_candidate is not None:
-            return family_candidate
+        if self.enable_template_family_enhancement:
+            family_candidate = self._family_guided_candidate(
+                request=request,
+                features=features,
+                toolkit=toolkit,
+                feedback=feedback,
+                previous_candidate=previous_candidate,
+            )
+            if family_candidate is not None:
+                return family_candidate
 
         if self.use_agents:
             try:
@@ -302,13 +339,23 @@ class IntentToP4LTLPipeline:
         if feedback is not None or previous_candidate is not None:
             return None
 
-        if features.template_family == "stateful_local":
+        if features.template_family in {"stateful_local", "guarded_forward_or_not_drop"}:
             candidate = self._build_stateful_local_candidate(request, toolkit)
             if candidate is not None:
                 return candidate
 
         if features.template_family == "in_band_header_added_or_preserved":
             candidate = self._build_in_band_header_candidate(request, toolkit)
+            if candidate is not None:
+                return candidate
+
+        if features.template_family == "header_removed_before_exit":
+            candidate = self._build_header_removed_before_exit_candidate(request, toolkit)
+            if candidate is not None:
+                return candidate
+
+        if features.template_family in {"state_selects_primary_action", "state_selects_backup_action"}:
+            candidate = self._build_next_hop_selection_candidate(request, toolkit, features.template_family)
             if candidate is not None:
                 return candidate
 
@@ -337,7 +384,7 @@ class IntentToP4LTLPipeline:
             } <= known_fields:
                 spec = (
                     "//#LTLProperty: "
-                    "[](AP(valid(hdr.tcp) && direction_0 == 1 && standard_metadata.ingress_port > 2 && "
+                    "[](AP(valid(hdr.tcp) && direction_0 == 1 && "
                     "MyIngress.bloom_filter_1 == 1 && MyIngress.bloom_filter_2 == 1) ==> AP(!drop))"
                 )
                 return P4LTLCandidate(
@@ -381,6 +428,73 @@ class IntentToP4LTLPipeline:
                 )
 
         return None
+
+    def _build_header_removed_before_exit_candidate(
+        self,
+        request: IntentToP4LTLRequest,
+        toolkit: ContextToolkit,
+    ) -> Optional[P4LTLCandidate]:
+        known_fields = set(toolkit.list_known_entities("field"))
+        if {"meta.egress_type", "hdr.telemetry", "hdr.ethernet.etherType"} <= known_fields:
+            spec = (
+                "//#LTLProperty: "
+                "[](AP(meta.egress_type == 0) ==> AP(!valid(hdr.telemetry) && hdr.ethernet.etherType == 0x0800))"
+            )
+            return P4LTLCandidate(
+                spec_text=spec,
+                assumptions=[
+                    "Used meta.egress_type == 0 as the local witness that the packet is leaving the network towards a host."
+                ],
+                self_checks=[
+                    "family-guided candidate for header_removed_before_exit",
+                    "required both telemetry removal and restored host-facing EtherType",
+                ],
+                evidence_used=["meta.egress_type", "hdr.telemetry", "hdr.ethernet.etherType"],
+                generation_rationale_summary="Programmatic host-exit template for telemetry-removal intents.",
+            )
+        return None
+
+    def _build_next_hop_selection_candidate(
+        self,
+        request: IntentToP4LTLRequest,
+        toolkit: ContextToolkit,
+        template_family: str,
+    ) -> Optional[P4LTLCandidate]:
+        known_fields = set(toolkit.list_known_entities("field"))
+        selected_field = None
+        for candidate in ("userMetadata.nextHop", "meta.nextHop"):
+            if candidate in known_fields:
+                selected_field = candidate
+                break
+        if selected_field is None or "MyIngress.linkState" not in known_fields:
+            return None
+
+        if template_family == "state_selects_primary_action" and "MyIngress.primaryNH" in known_fields:
+            spec = f"//#LTLProperty: [](AP(MyIngress.linkState == 1) ==> AP({selected_field} == MyIngress.primaryNH))"
+            rationale = "Programmatic primary-path retention template for healthy-link intents."
+            checks = [
+                "family-guided candidate for state_selects_primary_action",
+                "used explicit healthy-link witness and exact primary next-hop equality",
+            ]
+            evidence = ["MyIngress.linkState", selected_field, "MyIngress.primaryNH"]
+        elif template_family == "state_selects_backup_action" and "MyIngress.alternativeNH" in known_fields:
+            spec = f"//#LTLProperty: [](AP(MyIngress.linkState == 0) ==> AP({selected_field} == MyIngress.alternativeNH))"
+            rationale = "Programmatic backup-path selection template for failover intents."
+            checks = [
+                "family-guided candidate for state_selects_backup_action",
+                "used explicit failed-link witness and exact backup next-hop equality",
+            ]
+            evidence = ["MyIngress.linkState", selected_field, "MyIngress.alternativeNH"]
+        else:
+            return None
+
+        return P4LTLCandidate(
+            spec_text=spec,
+            assumptions=[],
+            self_checks=checks,
+            evidence_used=evidence,
+            generation_rationale_summary=rationale,
+        )
 
     def _build_in_band_header_candidate(
         self,
